@@ -1,7 +1,10 @@
+import os
+import json
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, date
+from datetime import datetime, date, time as dt_time, timedelta
+from zoneinfo import ZoneInfo
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -9,51 +12,182 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # 1. 網頁基本設定
-st.set_page_config(page_title="美股量化實戰雷達 3.0", page_icon="🦅", layout="wide")
-
-st.title("美股量化實戰追蹤系統 3.0")
-st.caption("直覺觸控縮放 K 線 ｜ 財報日避雷預警 ｜ 機構目標價與基本面 ｜ 華爾街即時新聞中心")
+st.set_page_config(page_title="美股量化實戰雷達 4.0", page_icon="🦅", layout="wide")
 
 # ==========================================
-# 側邊欄：參數、自動刷新與風控設定
+# 記憶儲存引擎 (自動記住預算、自選股、上次看的標的與持倉)
 # ==========================================
-st.sidebar.header("系統與自動刷新設定")
+MEMORY_FILE = "user_state_v4.json"
 
-auto_refresh = st.sidebar.toggle("開啟盤中自動更新", value=False, help="開啟後系統將定時自動抓取最新報價與K線")
+DEFAULT_STATE = {
+    "capital": 10000.0,
+    "risk_pct": 1.5,
+    "atr_mult": 2.0,
+    "custom_watchlist": "NVDA, TSLA, PLTR",
+    "last_selected_ticker": "NVDA",
+    "auto_pick_count": 12,
+    "portfolio": [
+        {"Ticker": "NVDA", "Shares": 10.0, "Avg_Cost": 120.0}
+    ]
+}
+
+def load_user_state():
+    if "user_state" not in st.session_state:
+        if os.path.exists(MEMORY_FILE):
+            try:
+                with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                    merged = DEFAULT_STATE.copy()
+                    merged.update(saved)
+                    st.session_state.user_state = merged
+            except Exception:
+                st.session_state.user_state = DEFAULT_STATE.copy()
+        else:
+            st.session_state.user_state = DEFAULT_STATE.copy()
+    return st.session_state.user_state
+
+def save_user_state():
+    try:
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(st.session_state.user_state, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+state = load_user_state()
+
+# ==========================================
+# 內建市場母體池 (供系統自動海選最強勢標的)
+# ==========================================
+MARKET_UNIVERSE = [
+    # 科技巨頭與核心權值
+    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "NFLX",
+    # AI 半導體與硬體
+    "AMD", "AVGO", "TSM", "MU", "ARM", "SMCI", "MRVL", "ANET", "VRT", "DELL",
+    # 軟體、資安與大數據
+    "PLTR", "CRWD", "PANW", "NOW", "SNOW", "ORCL", "CRM", "SHOP", "APP", "IOT",
+    # 金融、支付與加密概念
+    "JPM", "GS", "V", "MA", "AXP", "COIN", "HOOD", "SOFI", "MSTR",
+    # 醫療生技、消費與工業能源
+    "LLY", "ISRG", "UNH", "COST", "WMT", "UBER", "CAT", "GE", "XOM", "CEG", "VST"
+]
+
+# ==========================================
+# 美股開休市狀態自動偵測器 (美東時間 ET & 台灣時間)
+# ==========================================
+def get_us_market_status():
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    now_tw = datetime.now(ZoneInfo("Asia/Taipei"))
+    
+    # 美股主要固定國定假日 (2026)
+    us_holidays = {
+        date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
+        date(2026, 5, 25), date(2026, 6, 19), date(2026, 7, 3), date(2026, 9, 7),
+        date(2026, 11, 26), date(2026, 12, 25)
+    }
+    
+    weekday = now_et.weekday() # 0=週一 ... 5=週六, 6=週日
+    curr_time = now_et.time()
+    
+    open_t = dt_time(9, 30)
+    close_t = dt_time(16, 0)
+    pre_t = dt_time(4, 0)
+    after_t = dt_time(20, 0)
+    
+    if weekday >= 5 or now_et.date() in us_holidays:
+        status_badge = "🔴 美股休市中 (Market Closed - 週末/假日)"
+        detail = "目前為休市時段，系統顯示為最新一個交易日之收盤與籌碼數據。"
+    elif open_t <= curr_time < close_t:
+        close_dt = datetime.combine(now_et.date(), close_t, tzinfo=ZoneInfo("America/New_York"))
+        rem = close_dt - now_et
+        hrs, rem_s = divmod(int(rem.total_seconds()), 3600)
+        mins = rem_s // 60
+        status_badge = f"🟢 美股正規盤交易中 (Market OPEN) ｜ 距離收盤剩餘 {hrs}小時 {mins}分"
+        detail = "盤中即時報價與分時 K 線跳動中！"
+    elif pre_t <= curr_time < open_t:
+        open_dt = datetime.combine(now_et.date(), open_t, tzinfo=ZoneInfo("America/New_York"))
+        rem = open_dt - now_et
+        hrs, rem_s = divmod(int(rem.total_seconds()), 3600)
+        mins = rem_s // 60
+        status_badge = f"🌅 美股盤前交易時段 (Pre-Market) ｜ 距離正式開盤剩餘 {hrs}小時 {mins}分"
+        detail = "即將開盤，可留意盤前跳空與財報新聞。"
+    elif close_t <= curr_time < after_t:
+        status_badge = "🌙 美股盤後交易時段 (After-Hours)"
+        detail = "正規盤已收盤，目前為盤後電子盤交易時段。"
+    else:
+        status_badge = "🔴 美股休市中 (Overnight Closed)"
+        detail = "夜盤休市時段，等待美東時間 04:00 盤前開市。"
+        
+    time_str = f"🗽 美東時間: {now_et.strftime('%Y-%m-%d %H:%M')} ET ｜ 🇹🇼 台灣時間: {now_tw.strftime('%Y-%m-%d %H:%M')}"
+    return status_badge, detail, time_str
+
+# 頂部標題與開盤狀態橫幅
+st.title("美股量化實戰追蹤系統 4.0")
+mkt_badge, mkt_detail, mkt_clock = get_us_market_status()
+st.info(f"**{mkt_badge}** \n{mkt_clock} ｜{mkt_detail}")
+
+# ==========================================
+# 側邊欄：自動記憶設定、系統自動選股與風控參數
+# ==========================================
+st.sidebar.header("智慧記憶與選股設定")
+
+auto_refresh = st.sidebar.toggle("開啟盤中自動更新", value=False)
 refresh_sec = st.sidebar.selectbox("自動更新頻率 (秒)", [60, 180, 300], index=1)
 
-default_tickers = "NVDA, AAPL, MSFT, AMZN, META, TSLA, PLTR, AMD, AVGO, CRWD, LLY, SMCI, COIN"
-user_tickers = st.sidebar.text_area("監控標的清單 (逗號分隔)", default_tickers, height=90)
-tickers = [t.strip().upper() for t in user_tickers.split(",") if t.strip()]
+st.sidebar.subheader("系統自動選股 + 自選清單")
+new_auto_count = st.sidebar.slider("系統自動海選強勢股數量", min_value=5, max_value=25, value=int(state["auto_pick_count"]), step=1,
+                                   help="系統會從美股45+檔核心流動性母體池中，自動用演算法挑出分數最高的強勢股！")
+new_watchlist = st.sidebar.text_area("⭐ 我的自選觀察清單 (逗號分隔)", value=state["custom_watchlist"], height=70,
+                                     help="除了系統自動選出的股票外，你在這裡輸入的股票也一定會被加入追蹤！")
 
-st.sidebar.subheader("量化風控計算器")
-capital = st.sidebar.number_input("總投資本金 (USD)", min_value=500, value=10000, step=500)
-risk_pct = st.sidebar.slider("單筆最大承受虧損 (%)", min_value=0.5, max_value=5.0, value=1.5, step=0.5)
-atr_mult = st.sidebar.slider("ATR 停損寬度 (倍)", min_value=1.0, max_value=4.0, value=2.0, step=0.5)
+st.sidebar.subheader("預算與量化風控 (自動記憶)")
+new_capital = st.sidebar.number_input("我的總投資預算 (USD)", min_value=500.0, value=float(state["capital"]), step=500.0)
+new_risk = st.sidebar.slider("單筆最大承受虧損 (%)", 0.5, 5.0, float(state["risk_pct"]), 0.5)
+new_atr = st.sidebar.slider("ATR 停損寬度 (倍)", 1.0, 4.0, float(state["atr_mult"]), 0.5)
 
-st.sidebar.subheader("快速過濾")
+# 若參數有變更，立即自動儲存記憶
+if (new_auto_count != state["auto_pick_count"] or new_watchlist != state["custom_watchlist"] or
+    new_capital != state["capital"] or new_risk != state["risk_pct"] or new_atr != state["atr_mult"]):
+    state["auto_pick_count"] = new_auto_count
+    state["custom_watchlist"] = new_watchlist
+    state["capital"] = new_capital
+    state["risk_pct"] = new_risk
+    state["atr_mult"] = new_atr
+    save_user_state()
+
+st.sidebar.subheader("表格快速過濾")
 min_score = st.sidebar.slider("最低強度評分門檻", 0, 100, 0, 5)
 only_inflow = st.sidebar.checkbox("只顯示「主力資金淨流入 (CMF > 0)」", value=False)
 
+with st.sidebar.expander("記憶備份碼 (跨裝置/防重置保護)"):
+    st.caption("系統已自動在雲端記憶你的設定。若你想跨手機/電腦同步，可複製下方備份碼：")
+    backup_str = json.dumps(state, ensure_ascii=False)
+    st.code(backup_str, language="json")
+    restore_input = st.text_input("貼上備份碼還原設定：")
+    if st.button("還原記憶設定") and restore_input:
+        try:
+            st.session_state.user_state = json.loads(restore_input)
+            save_user_state()
+            st.success("已成功還原！")
+            st.rerun()
+        except Exception:
+            st.error("備份碼格式錯誤")
+
+# 解析使用者的自選股與持倉股
+user_custom_list = [t.strip().upper() for t in state["custom_watchlist"].split(",") if t.strip()]
+portfolio_tickers = [str(item.get("Ticker", "")).strip().upper() for item in state["portfolio"] if item.get("Ticker")]
+
 # ==========================================
-# 輔助函數：抓取財報日期、基本面與即時新聞
+# 輔助函數：財報日、基本面與純英文華爾街新聞
 # ==========================================
-@st.cache_data(ttl=1800) # 快取 30 分鐘，避免拖慢盤中速度
+@st.cache_data(ttl=1800)
 def get_earnings_and_fundamentals(sym):
     res = {
-        "earnings_str": "未知",
-        "days_to_earnings": 999,
-        "pe_forward": None,
-        "peg": None,
-        "rev_growth": None,
-        "profit_margin": None,
-        "target_price": None,
-        "recommendation": "N/A",
-        "market_cap_b": None
+        "earnings_str": "未知", "days_to_earnings": 999,
+        "pe_forward": None, "rev_growth": None, "profit_margin": None,
+        "target_price": None, "recommendation": "N/A"
     }
     try:
         tk = yf.Ticker(sym)
-        # 1. 取得下次財報日
         cal = tk.calendar
         e_date = None
         if isinstance(cal, dict) and 'Earnings Date' in cal and len(cal['Earnings Date']) > 0:
@@ -71,74 +205,45 @@ def get_earnings_and_fundamentals(sym):
                 days_diff = (e_date - date.today()).days
                 res["days_to_earnings"] = days_diff
                 if 0 <= days_diff <= 14:
-                    res["earnings_str"] = f"{e_date.strftime('%m/%d')} ({days_diff}天後)"
+                    res["earnings_str"] = f"{e_date.strftime('%m/%d')} ({days_diff}d)"
                 elif days_diff > 14:
-                    res["earnings_str"] = f"{e_date.strftime('%m/%d')} ({days_diff}天後)"
+                    res["earnings_str"] = f"{e_date.strftime('%m/%d')} ({days_diff}d)"
                 else:
-                    res["earnings_str"] = f"已公布 ({e_date.strftime('%m/%d')})"
+                    res["earnings_str"] = f"Passed ({e_date.strftime('%m/%d')})"
                     
-        # 2. 取得基本面與華爾街目標價
         info = tk.info
         if isinstance(info, dict):
             res["pe_forward"] = info.get("forwardPE")
-            res["peg"] = info.get("pegRatio")
             res["rev_growth"] = info.get("revenueGrowth")
             res["profit_margin"] = info.get("profitMargins")
             res["target_price"] = info.get("targetMeanPrice")
             res["recommendation"] = str(info.get("recommendationKey", "N/A")).upper()
-            mcap = info.get("marketCap")
-            if mcap:
-                res["market_cap_b"] = round(mcap / 1e9, 1)
     except Exception:
         pass
     return res
 
-@st.cache_data(ttl=300) # 新聞快取 5 分鐘
-def fetch_realtime_news(sym):
+@st.cache_data(ttl=300)
+def fetch_english_news(sym, is_macro=False):
     news_items = []
-    # 優先從 Yahoo Finance API 抓取結構化新聞
+    # 使用 Google News US English RSS 確保 100% 純英文華爾街財經新聞與穩定連結
     try:
-        raw_news = yf.Ticker(sym).news
-        for item in raw_news[:8]:
-            content = item.get("content", item)
-            title = content.get("title")
-            # 解析連結
-            link = ""
-            if "canonicalUrl" in content and isinstance(content["canonicalUrl"], dict):
-                link = content["canonicalUrl"].get("url", "")
-            elif "clickThroughUrl" in content and isinstance(content["clickThroughUrl"], dict):
-                link = content["clickThroughUrl"].get("url", "")
-            else:
-                link = content.get("link", "")
-            # 解析機構與時間
-            provider = content.get("provider", {}).get("displayName", item.get("publisher", "Yahoo Finance"))
-            pub_time = content.get("pubDate", item.get("providerPublishTime", ""))
-            if isinstance(pub_time, (int, float)):
-                pub_time = datetime.fromtimestamp(pub_time).strftime('%m-%d %H:%M')
-            elif isinstance(pub_time, str) and len(pub_time) >= 16:
-                pub_time = pub_time[:16].replace("T", " ")
-            if title:
-                news_items.append({"title": title, "link": link, "publisher": provider, "time": pub_time})
+        if is_macro:
+            query = "US+stock+market+Wall+Street+Fed+S%26P500"
+        else:
+            query = f"{sym}+stock+wall+street+earnings"
+        url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            root = ET.fromstring(response.read())
+            for item in root.findall('.//item')[:8]:
+                title = item.find('title').text if item.find('title') is not None else ""
+                link = item.find('link').text if item.find('link') is not None else ""
+                pub = item.find('source').text if item.find('source') is not None else "US Financial News"
+                pub_date = item.find('pubDate').text[:16] if item.find('pubDate') is not None else ""
+                if title:
+                    news_items.append({"title": title, "link": link, "publisher": pub, "time": pub_date})
     except Exception:
         pass
-        
-    # 備援機制：透過 Google News RSS 抓取即時財經新聞
-    if not news_items:
-        try:
-            query = "US+stock+market+Wall+Street" if sym in ["SPY", "QQQ"] else f"{sym}+stock+news"
-            url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=5) as response:
-                root = ET.fromstring(response.read())
-                for item in root.findall('.//item')[:8]:
-                    news_items.append({
-                        "title": item.find('title').text if item.find('title') is not None else "",
-                        "link": item.find('link').text if item.find('link') is not None else "",
-                        "publisher": item.find('source').text if item.find('source') is not None else "Financial News",
-                        "time": item.find('pubDate').text[:16] if item.find('pubDate') is not None else ""
-                    })
-        except Exception:
-            pass
     return news_items
 
 # ==========================================
@@ -151,49 +256,31 @@ def get_macro_dashboard():
     symbols = ["^VIX", "SPY", "QQQ", "^SOX", "IWM", "^TNX"]
     data = yf.download(symbols, period="6mo", interval="1d", progress=False)
     close = data['Close'] if isinstance(data.columns, pd.MultiIndex) else data
-    
     metrics = {}
     for sym in symbols:
         if sym in close.columns:
             s = close[sym].dropna()
             if len(s) >= 50:
-                curr = float(s.iloc[-1])
-                prev = float(s.iloc[-2])
-                chg_pct = ((curr - prev) / prev) * 100
-                chg_abs = curr - prev
-                ma20 = float(s.rolling(20).mean().iloc[-1])
-                ma50 = float(s.rolling(50).mean().iloc[-1])
+                curr, prev = float(s.iloc[-1]), float(s.iloc[-2])
                 metrics[sym] = {
-                    "curr": curr, "chg_pct": chg_pct, "chg_abs": chg_abs,
-                    "ma20": ma20, "ma50": ma50
+                    "curr": curr, "chg_pct": ((curr - prev) / prev) * 100, "chg_abs": curr - prev,
+                    "ma20": float(s.rolling(20).mean().iloc[-1]), "ma50": float(s.rolling(50).mean().iloc[-1])
                 }
     return metrics
 
 try:
     m_data = get_macro_dashboard()
-    vix = m_data["^VIX"]["curr"]
-    vix_diff = m_data["^VIX"]["chg_abs"]
-    
+    vix, vix_diff = m_data["^VIX"]["curr"], m_data["^VIX"]["chg_abs"]
     col_gauge, col_metrics = st.columns([1.3, 2.7])
     
     with col_gauge:
-        if vix < 15:
-            vix_status = "🟢 極度樂觀 (留意追高風險)"
-        elif vix < 20:
-            vix_status = "🟢 穩定偏多 (適合順勢做多)"
-        elif vix < 30:
-            vix_status = "🟠 警戒震盪 (縮小倉位/買黑不買紅)"
-        else:
-            vix_status = "🔴 極度恐慌 (嚴控風險/留意底部反轉)"
-            
+        vix_status = "🟢 極度樂觀 (留意追高)" if vix < 15 else ("🟢 穩定偏多 (順勢做多)" if vix < 20 else ("🟠 警戒震盪 (縮小倉位)" if vix < 30 else "🔴 極度恐慌 (留意反轉)"))
         fig_gauge = go.Figure(go.Indicator(
-            mode="gauge+number+delta",
-            value=vix,
+            mode="gauge+number+delta", value=vix,
             delta={'reference': vix - vix_diff, 'increasing': {'color': "#ef5350"}, 'decreasing': {'color': "#26a69a"}},
             title={'text': f"<b>VIX 恐慌指數</b><br><span style='font-size:13px;color:gray'>{vix_status}</span>"},
             gauge={
-                'axis': {'range': [10, 45], 'tickwidth': 1},
-                'bar': {'color': "white", 'thickness': 0.25},
+                'axis': {'range': [10, 45], 'tickwidth': 1}, 'bar': {'color': "white", 'thickness': 0.25},
                 'steps': [
                     {'range': [10, 15], 'color': "rgba(38, 166, 154, 0.45)"},
                     {'range': [15, 20], 'color': "rgba(102, 187, 106, 0.35)"},
@@ -203,60 +290,57 @@ try:
                 'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': 30}
             }
         ))
-        fig_gauge.update_layout(height=240, margin=dict(l=20, r=20, t=50, b=10), template="plotly_dark")
+        fig_gauge.update_layout(height=230, margin=dict(l=20, r=20, t=50, b=10), template="plotly_dark")
         st.plotly_chart(fig_gauge, use_container_width=True)
 
     with col_metrics:
         c1, c2, c3 = st.columns(3)
         spy, qqq, sox, iwm, tnx = m_data["SPY"], m_data["QQQ"], m_data["^SOX"], m_data["IWM"], m_data["^TNX"]
-        
-        c1.metric("標普 500 (SPY 大盤)", f"${spy['curr']:.2f}", f"{spy['chg_pct']:+.2f}%")
-        c2.metric("納斯達克 (QQQ 科技股)", f"${qqq['curr']:.2f}", f"{qqq['chg_pct']:+.2f}%")
-        c3.metric("費城半導體 (^SOX AI硬體)", f"{sox['curr']:.1f}", f"{sox['chg_pct']:+.2f}%")
-        
+        c1.metric("標普 500 (SPY)", f"${spy['curr']:.2f}", f"{spy['chg_pct']:+.2f}%")
+        c2.metric("納斯達克 (QQQ)", f"${qqq['curr']:.2f}", f"{qqq['chg_pct']:+.2f}%")
+        c3.metric("費城半導體 (^SOX)", f"{sox['curr']:.1f}", f"{sox['chg_pct']:+.2f}%")
         c4, c5, c6 = st.columns(3)
-        c4.metric("羅素 2000 (IWM 中小型股)", f"${iwm['curr']:.2f}", f"{iwm['chg_pct']:+.2f}%")
+        c4.metric("羅素 2000 (IWM)", f"${iwm['curr']:.2f}", f"{iwm['chg_pct']:+.2f}%")
         c5.metric("10年期美債殖利率 (^TNX)", f"{tnx['curr']:.2f}%", f"{tnx['chg_abs']:+.2f}", delta_color="inverse")
-        
         with c6:
-            st.markdown("##### 盤勢綜合診斷")
+            st.markdown("#####盤勢綜合診斷")
             if vix < 20 and spy['curr'] > spy['ma20'] and qqq['curr'] > qqq['ma20']:
-                st.success("**🟢 多頭順風車**：大盤與科技股皆站穩月線且恐慌低，可積極操作高分強勢股。")
+                st.success("**🟢 多頭順風車**：大盤站穩月線且恐慌低，系統自動選股勝率高。")
             elif vix >= 25 or spy['curr'] < spy['ma50']:
-                st.error("**🔴 風險警戒區**：VIX 偏高或大盤跌破季線，建議保留現金、減少新開倉。")
+                st.error("**🔴 風險警戒區**：大盤跌破季線或恐慌飆升，建議提高現金比例。")
             else:
-                st.warning("**🟡 結構性震盪**：指數整理中，避免追高，鎖定「CMF > 0.1」主力護盤股。")
+                st.warning("**🟡 結構性震盪**：個股表現分化，優先鎖定高 CMF 吸籌標的。")
 except Exception as e:
     st.warning(f"正在同步大盤宏觀數據... ({e})")
 
 st.divider()
 
 # ==========================================
-# 模組二：100分制動態評分、財報避雷與主力籌碼表
+# 全自動海選引擎 (掃描全市場母體池 + 自選股 + 持倉股)
 # ==========================================
-st.subheader("主力動向、財報預警")
-
-@st.cache_data(ttl=120)
-def scan_stocks_v3(ticker_list, total_cap, risk_p, atr_m):
-    results = []
-    raw_histories = {}
+@st.cache_data(ttl=180)
+def run_quant_screener(universe_list, custom_list, port_list, auto_top_n, total_cap, risk_p, atr_m):
+    all_symbols = list(dict.fromkeys(universe_list + custom_list + port_list))
+    data = yf.download(all_symbols, period="1y", interval="1d", group_by="ticker", progress=False)
     
-    for sym in ticker_list:
+    scored_items = []
+    raw_histories = {}
+    price_lookup = {}
+    atr_stop_lookup = {}
+    
+    for sym in all_symbols:
         try:
-            df = yf.download(sym, period="1y", interval="1d", progress=False)
+            df = data[sym].dropna() if len(all_symbols) > 1 else data.dropna()
             if len(df) < 200:
                 continue
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df = df.dropna()
             raw_histories[sym] = df
             
             close, high, low, vol = df['Close'], df['High'], df['Low'], df['Volume']
             curr_p = float(close.iloc[-1])
             prev_p = float(close.iloc[-2])
             pct_chg = ((curr_p - prev_p) / prev_p) * 100
+            price_lookup[sym] = curr_p
             
-            # 均線、量比、CMF、RSI、ATR
             ma20 = float(close.rolling(20).mean().iloc[-1])
             ma50 = float(close.rolling(50).mean().iloc[-1])
             ma200 = float(close.rolling(200).mean().iloc[-1])
@@ -275,60 +359,200 @@ def scan_stocks_v3(ticker_list, total_cap, risk_p, atr_m):
             tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
             atr14 = float(tr.rolling(14).mean().iloc[-1])
             stop_loss_price = curr_p - (atr_m * atr14)
+            atr_stop_lookup[sym] = stop_loss_price
             risk_per_share = curr_p - stop_loss_price
             suggested_shares = int((total_cap * (risk_p / 100.0)) // risk_per_share) if risk_per_share > 0 else 0
 
-            # 100分制動態加權
+            # 100分制量化評分
             trend_pts = (12 if curr_p > ma20 else 0) + (10 if curr_p > ma50 else 0) + (10 if curr_p > ma200 else 0) + (8 if ma20 > ma50 > ma200 else 0)
             cmf_pts = int(((max(-0.25, min(0.25, cmf20)) + 0.25) / 0.50) * 30)
             rvol_pts = int(min(20, max(0, (rvol - 0.5) * 13))) if pct_chg >= 0 else int(max(0, 10 - (rvol - 0.8) * 10))
             rsi_pts = 10 if 50 <= rsi14 <= 72 else (6 if (40 <= rsi14 < 50 or 72 < rsi14 <= 80) else 2)
             total_score = int(min(100, max(5, trend_pts + cmf_pts + rvol_pts + rsi_pts)))
             
-            # 取得財報日資訊
-            f_info = get_earnings_and_fundamentals(sym)
-            
-            if 0 <= f_info["days_to_earnings"] <= 7:
-                signal = "財報將至 (注意跳空風險)"
-            elif total_score >= 80 and rvol >= 1.3:
-                signal = "主力點火突破 (極強)"
-            elif total_score >= 70:
-                signal = "多頭穩健推進 (偏多)"
-            elif cmf20 >= 0.10 and curr_p < ma20:
-                signal = "回檔暗池吸籌 (逢低留意)"
-            elif total_score <= 35:
-                signal = "空頭走弱 / 主力撤退"
-            else:
-                signal = "區間整理 (等待方向)"
-                
-            results.append({
-                "代號": sym,
-                "強度評分": total_score,
-                "實戰訊號": signal,
-                "下次財報日": f_info["earnings_str"],
-                "現價 ($)": round(curr_p, 2),
-                "單日漲跌 (%)": round(pct_chg, 2),
-                "近20日走勢": close.tail(20).tolist(),
-                "CMF 主力資金": round(cmf20, 3),
-                "RVOL 量比": round(rvol, 2),
-                "ATR 停損價 ($)": round(stop_loss_price, 2),
-                "建議買進股數": suggested_shares
+            scored_items.append({
+                "sym": sym, "score": total_score, "curr_p": curr_p, "pct_chg": pct_chg,
+                "trend_20d": close.tail(20).tolist(), "cmf20": cmf20, "rvol": rvol,
+                "rsi14": rsi14, "ma20": ma20, "stop_loss": stop_loss_price, "shares": suggested_shares
             })
         except Exception:
             continue
             
-    df_out = pd.DataFrame(results)
-    if not df_out.empty:
-        df_out = df_out.sort_values(by=["強度評分", "CMF 主力資金"], ascending=[False, False])
-    return df_out, raw_histories
+    # 先按分數與主力資金排序，挑出系統自動海選 Top N，並強制保留使用者的自選股與持倉股
+    scored_items.sort(key=lambda x: (x["score"], x["cmf20"]), reverse=True)
+    
+    final_rows = []
+    auto_picked_count = 0
+    for item in scored_items:
+        sym = item["sym"]
+        is_custom = sym in custom_list
+        is_port = sym in port_list
+        
+        if auto_picked_count < auto_top_n or is_custom or is_port:
+            if not is_custom and not is_port:
+                auto_picked_count += 1
+                
+            # 標記來源標籤
+            tags = []
+            if is_port: tags.append("持倉")
+            if is_custom: tags.append("⭐自選")
+            if not tags or item["score"] >= 75: tags.append("系統優選")
+            source_tag = " / ".join(tags)
+            
+            f_info = get_earnings_and_fundamentals(sym)
+            if 0 <= f_info["days_to_earnings"] <= 7:
+                signal = "財報將至 (避開跳空)"
+            elif item["score"] >= 80 and item["rvol"] >= 1.3:
+                signal = "主力點火突破 (極強)"
+            elif item["score"] >= 70:
+                signal = "多頭穩健推進 (偏多)"
+            elif item["cmf20"] >= 0.10 and item["curr_p"] < item["ma20"]:
+                signal = "回檔暗池吸籌 (留意)"
+            elif item["score"] <= 35:
+                signal = "空頭走弱 / 主力撤退"
+            else:
+                signal = "區間整理 (等待方向)"
+                
+            final_rows.append({
+                "代號": sym,
+                "入選來源": source_tag,
+                "強度評分": item["score"],
+                "實戰訊號": signal,
+                "下次財報日": f_info["earnings_str"],
+                "現價 ($)": round(item["curr_p"], 2),
+                "單日漲跌 (%)": round(item["pct_chg"], 2),
+                "近20日走勢": item["trend_20d"],
+                "CMF 主力資金": round(item["cmf20"], 3),
+                "RVOL 量比": round(item["rvol"], 2),
+                "ATR 停損價 ($)": round(item["stop_loss"], 2),
+                "風控建議股數": item["shares"]
+            })
+            
+    return pd.DataFrame(final_rows), raw_histories, price_lookup, atr_stop_lookup
+
+with st.spinner("正在掃描全市場 45+ 檔核心標的，自動海選最強趨勢股與計算持倉損益..."):
+    df_scan, histories, live_prices, live_stops = run_quant_screener(
+        MARKET_UNIVERSE, user_custom_list, portfolio_tickers,
+        state["auto_pick_count"], state["capital"], state["risk_pct"], state["atr_mult"]
+    )
+
+# ==========================================
+# 模組二：持倉部位與預算管理 (自動記憶)
+# ==========================================
+st.subheader("我的持倉倉位與預算損益管理（支援直接編輯 ＆ 自動記憶）")
+st.caption("你可以在下方表格直接**修改股數與成本價**、點擊表格底部 `+` **新增持倉**，或勾選左側垃圾桶**刪除持倉**，系統會自動記憶並即時計算損益與停損警報！")
+
+col_port_edit, col_port_summary = st.columns([1.4, 2.6])
+
+with col_port_edit:
+    st.markdown("##### 編輯我的持倉清單")
+    port_df_input = pd.DataFrame(state["portfolio"]) if state["portfolio"] else pd.DataFrame(columns=["Ticker", "Shares", "Avg_Cost"])
+    edited_port_df = st.data_editor(
+        port_df_input,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Ticker": st.column_config.TextColumn("股票代號", required=True),
+            "Shares": st.column_config.NumberColumn("持有股數", min_value=0.0, step=1.0, required=True),
+            "Avg_Cost": st.column_config.NumberColumn("平均買進成本 ($)", min_value=0.01, step=0.5, required=True)
+        }
+    )
+    # 檢查持倉是否有變更並自動存檔
+    cleaned_port = []
+    for _, r in edited_port_df.iterrows():
+        t_val = str(r.get("Ticker", "")).strip().upper()
+        s_val = float(r.get("Shares", 0) or 0)
+        c_val = float(r.get("Avg_Cost", 0) or 0)
+        if t_val and s_val > 0:
+            cleaned_port.append({"Ticker": t_val, "Shares": s_val, "Avg_Cost": c_val})
+    if cleaned_port != state["portfolio"]:
+        state["portfolio"] = cleaned_port
+        save_user_state()
+        st.rerun()
+
+with col_port_summary:
+    st.markdown("#####倉位即時損益與 ATR 停損診斷")
+    port_eval_rows = []
+    total_market_val = 0.0
+    total_cost_val = 0.0
+    
+    for item in state["portfolio"]:
+        sym = item["Ticker"]
+        shares = item["Shares"]
+        cost = item["Avg_Cost"]
+        curr_p = live_prices.get(sym)
+        if curr_p is None:
+            try:
+                curr_p = float(yf.Ticker(sym).fast_info['lastPrice'])
+            except Exception:
+                curr_p = cost
+        stop_p = live_stops.get(sym, curr_p * 0.92)
+        
+        mkt_val = shares * curr_p
+        cost_val = shares * cost
+        pnl_usd = mkt_val - cost_val
+        pnl_pct = ((curr_p - cost) / cost) * 100 if cost > 0 else 0.0
+        
+        total_market_val += mkt_val
+        total_cost_val += cost_val
+        
+        if curr_p <= stop_p:
+            action_hint = "觸及 ATR 停損！建議嚴格執行風控"
+        elif pnl_pct >= 15:
+            action_hint = "獲利豐厚，可將停損上移鎖住獲利"
+        else:
+            action_hint = "正常續抱 (守穩停損線之上)"
+            
+        port_eval_rows.append({
+            "代號": sym,
+            "股數": shares,
+            "成本價": round(cost, 2),
+            "現價": round(curr_p, 2),
+            "持倉市值 ($)": round(mkt_val, 2),
+            "未實現損益 ($)": round(pnl_usd, 2),
+            "報酬率 (%)": round(pnl_pct, 2),
+            "ATR 防守停損價": round(stop_p, 2),
+            "倉位診斷": action_hint
+        })
+        
+    remaining_cash = state["capital"] - total_cost_val
+    total_equity = remaining_cash + total_market_val
+    total_pnl = total_market_val - total_cost_val
+    pos_ratio = (total_market_val / total_equity * 100) if total_equity > 0 else 0.0
+    
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("總資產淨值 (含未實現)", f"${total_equity:,.2f}", f"{total_pnl:+,.2f} USD")
+    m2.metric("目前持倉總市值", f"${total_market_val:,.2f}", f"水位佔比 {pos_ratio:.1f}%", delta_color="off")
+    m3.metric("剩餘可用現金預算", f"${remaining_cash:,.2f}")
+    m4.metric("設定總預算基準", f"${state['capital']:,.0f}")
+    
+    if port_eval_rows:
+        st.dataframe(
+            pd.DataFrame(port_eval_rows),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "未實現損益 ($)": st.column_config.NumberColumn("損益 ($)", format="$%+.2f"),
+                "報酬率 (%)": st.column_config.NumberColumn("報酬率 (%)", format="%+.2f%%")
+            }
+        )
+    else:
+        st.info("目前尚無持倉部位，可在左側表格新增你買進的股票與成本價！")
+
+st.divider()
+
+# ==========================================
+# 模組三：系統自動海選強勢股 ＋ 自選股雷達總表
+# ==========================================
+st.subheader("AI 演算法全市場自動海選強勢股 ＆ 自選股雷達")
+st.caption(f"系統已從美股 45+ 檔核心流動性標的池中，自動為你海選出 **Top {state['auto_pick_count']} 最強勢標的（🤖系統優選）**，並合併你的 **⭐自選觀察** 與 **💼持倉部位**！")
 
 col_b1, col_b2 = st.columns([1, 4])
 with col_b1:
-    if st.button("立即手動更新報價", use_container_width=True):
+    if st.button("立即重新掃描全市場", use_container_width=True):
         st.cache_data.clear()
-
-with st.spinner("正在運算多因子模型、主力籌碼與財報日曆..."):
-    df_scan, histories = scan_stocks_v3(tickers, capital, risk_pct, atr_mult)
+        st.rerun()
 
 if not df_scan.empty:
     df_filtered = df_scan[df_scan["強度評分"] >= min_score]
@@ -341,7 +565,7 @@ if not df_scan.empty:
         hide_index=True,
         column_config={
             "強度評分": st.column_config.ProgressColumn("綜合強度 (0-100)", format="%d 分", min_value=0, max_value=100),
-            "下次財報日": st.column_config.TextColumn("財報避雷針", help="財報公布前後常有劇烈跳空，14天內公布會亮起⚠️警示"),
+            "下次財報日": st.column_config.TextColumn("📅 財報避雷針"),
             "近20日走勢": st.column_config.LineChartColumn("近20日趨勢線"),
             "單日漲跌 (%)": st.column_config.NumberColumn("漲跌幅 (%)", format="%+.2f%%"),
             "CMF 主力資金": st.column_config.NumberColumn("CMF 籌碼流", help=">0 代表主力買超吸籌，>0.1 為強烈買進"),
@@ -352,15 +576,21 @@ if not df_scan.empty:
 st.divider()
 
 # ==========================================
-# 模組三：支援「雙指捏合縮放 / 單指拖曳」的 K 線看盤室
+# 上次瀏覽標的 K 線
 # ==========================================
-st.subheader("K 線")
-st.caption("操作小撇步：在 K 線圖上直接用「單指左右滑動」可平移時間軸，用「雙指張開/捏合（或滑鼠滾輪）」可自由放大縮小！快點兩下即可恢復預設大小。")
+st.subheader(" K 線（自動記憶上次查看標的）")
+st.caption("操作小撇步：在 K 線圖上直接用「單指左右滑動」可平移時間軸，用「雙指張開/捏合（或滑鼠滾輪）」可自由放大縮小！")
 
-if histories:
+if not df_scan.empty:
+    available_tickers = df_scan["代號"].tolist()
+    default_idx = available_tickers.index(state["last_selected_ticker"]) if state["last_selected_ticker"] in available_tickers else 0
+    
     c_sel1, c_sel2 = st.columns([1, 2])
     with c_sel1:
-        selected_ticker = st.selectbox("選擇深度剖析標的：", list(histories.keys()))
+        selected_ticker = st.selectbox("選擇深度剖析標的 (自動記憶)：", available_tickers, index=default_idx)
+        if selected_ticker != state["last_selected_ticker"]:
+            state["last_selected_ticker"] = selected_ticker
+            save_user_state()
     with c_sel2:
         timeframe = st.radio(
             "選擇 K 線週期：",
@@ -368,10 +598,9 @@ if histories:
             horizontal=True
         )
         
-    # 觸控與滾輪縮放的核心設定
     touch_chart_config = {
-        'scrollZoom': True,      # 開啟雙指捏合縮放與滑鼠滾輪縮放
-        'displayModeBar': True,  # 顯示右上角工具列
+        'scrollZoom': True,
+        'displayModeBar': True,
         'modeBarButtonsToRemove': ['select2d', 'lasso2d']
     }
         
@@ -387,13 +616,10 @@ if histories:
             rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.58, 0.18, 0.24],
             subplot_titles=(f"{selected_ticker} 日 K 線 (20MA / 50MA / 200MA)", "成交量 (Volume)", "CMF 主力資金流向 (綠柱吸籌 / 紅柱出貨)")
         )
-        fig.add_trace(go.Candlestick(
-            x=df_plot.index, open=df_plot['Open'], high=df_plot['High'],
-            low=df_plot['Low'], close=df_plot['Close'], name="日K線"
-        ), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['MA20'], line=dict(color='#FFA726', width=1.5), name='20MA (月線)'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['MA50'], line=dict(color='#29B6F6', width=1.5), name='50MA (季線)'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['MA200'], line=dict(color='#AB47BC', width=1.5, dash='dot'), name='200MA (年線)'), row=1, col=1)
+        fig.add_trace(go.Candlestick(x=df_plot.index, open=df_plot['Open'], high=df_plot['High'], low=df_plot['Low'], close=df_plot['Close'], name="日K線"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['MA20'], line=dict(color='#FFA726', width=1.5), name='20MA'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['MA50'], line=dict(color='#29B6F6', width=1.5), name='50MA'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['MA200'], line=dict(color='#AB47BC', width=1.5, dash='dot'), name='200MA'), row=1, col=1)
         
         vol_colors = ['#ef5350' if c < o else '#26a69a' for c, o in zip(df_plot['Close'], df_plot['Open'])]
         fig.add_trace(go.Bar(x=df_plot.index, y=df_plot['Volume'], marker_color=vol_colors, name="成交量"), row=2, col=1)
@@ -403,15 +629,12 @@ if histories:
         fig.add_hline(y=0, line_dash="dash", line_color="gray", row=3, col=1)
         
         fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-        # 關鍵修正：dragmode='pan' 讓手指滑動變成平移而非拉框框，fixedrange=False 允許自由縮放
         fig.update_layout(height=720, xaxis_rangeslider_visible=False, template="plotly_dark", dragmode="pan")
         fig.update_yaxes(fixedrange=False)
         st.plotly_chart(fig, use_container_width=True, config=touch_chart_config)
-        
     else:
         interval_str = "5m" if "5 分鐘" in timeframe else "15m"
         period_str = "5d" if interval_str == "5m" else "1mo"
-        
         with st.spinner(f"正在載入 {selected_ticker} 的 {interval_str} 盤中即時 K 線..."):
             df_intra = yf.download(selected_ticker, period=period_str, interval=interval_str, progress=False)
             if isinstance(df_intra.columns, pd.MultiIndex):
@@ -419,25 +642,19 @@ if histories:
             df_intra = df_intra.dropna().tail(150).copy()
             
             df_intra['EMA20'] = df_intra['Close'].ewm(span=20).mean()
-            
-            # 關鍵精準度修正：VWAP 必須「每個交易日開盤重新歸零計算」
             df_intra['Date'] = df_intra.index.date
             df_intra['TypPrice'] = (df_intra['High'] + df_intra['Low'] + df_intra['Close']) / 3
             df_intra['VP'] = df_intra['TypPrice'] * df_intra['Volume']
             df_intra['VWAP'] = df_intra.groupby('Date')['VP'].cumsum() / (df_intra.groupby('Date')['Volume'].cumsum() + 1e-9)
             
             time_labels = df_intra.index.strftime('%m-%d %H:%M')
-            
             fig_intra = make_subplots(
                 rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.72, 0.28],
                 subplot_titles=(f"{selected_ticker} 盤中 {interval_str} K 線 (20EMA 與 每日重置機構 VWAP)", "盤中分時成交量")
             )
-            fig_intra.add_trace(go.Candlestick(
-                x=time_labels, open=df_intra['Open'], high=df_intra['High'],
-                low=df_intra['Low'], close=df_intra['Close'], name=f"{interval_str} K線"
-            ), row=1, col=1)
+            fig_intra.add_trace(go.Candlestick(x=time_labels, open=df_intra['Open'], high=df_intra['High'], low=df_intra['Low'], close=df_intra['Close'], name=f"{interval_str} K線"), row=1, col=1)
             fig_intra.add_trace(go.Scatter(x=time_labels, y=df_intra['EMA20'], line=dict(color='#FFA726', width=1.5), name='20 EMA'), row=1, col=1)
-            fig_intra.add_trace(go.Scatter(x=time_labels, y=df_intra['VWAP'], line=dict(color='#FFEE58', width=1.5, dash='dash'), name='當日 VWAP (機構均價線)'), row=1, col=1)
+            fig_intra.add_trace(go.Scatter(x=time_labels, y=df_intra['VWAP'], line=dict(color='#FFEE58', width=1.5, dash='dash'), name='當日 VWAP'), row=1, col=1)
             
             v_colors = ['#ef5350' if c < o else '#26a69a' for c, o in zip(df_intra['Close'], df_intra['Open'])]
             fig_intra.add_trace(go.Bar(x=time_labels, y=df_intra['Volume'], marker_color=v_colors, name="分時量"), row=2, col=1)
@@ -449,56 +666,52 @@ if histories:
 st.divider()
 
 # ==========================================
-# 個股財報體質、華爾街目標價 ＆ 即時新聞中心
+# 個股財報基本面 ＆ 華爾街純英文即時外電 
 # ==========================================
-st.subheader(f"模組四：{selected_ticker} 財報基本面體質 ＆ 華爾街即時新聞")
+st.subheader(f"：{selected_ticker} 財報基本面體質 ＆ Wall Street English News")
 
 col_fund, col_news = st.columns([1.2, 1.8])
 
 with col_fund:
-    st.markdown(f"#### {selected_ticker} 財報與機構評級卡片")
+    st.markdown(f"#### {selected_ticker} Earnings & Fundamentals")
     f_data = get_earnings_and_fundamentals(selected_ticker)
     curr_price_sel = float(histories[selected_ticker]['Close'].iloc[-1])
     
     f1, f2 = st.columns(2)
-    f1.metric("下次財報公布日", f_data["earnings_str"])
-    
+    f1.metric("Next Earnings Date", f_data["earnings_str"])
     if f_data["target_price"]:
         upside = ((f_data["target_price"] - curr_price_sel) / curr_price_sel) * 100
-        f2.metric("華爾街平均目標價", f"${f_data['target_price']:.2f}", f"{upside:+.1f}% 潛在空間")
+        f2.metric("Analyst Target Price", f"${f_data['target_price']:.2f}", f"{upside:+.1f}% Upside")
     else:
-        f2.metric("華爾街平均目標價", "N/A")
+        f2.metric("Analyst Target Price", "N/A")
         
     f3, f4 = st.columns(2)
-    f3.metric("預估本益比 (Forward P/E)", f"{f_data['pe_forward']:.1f}x" if f_data["pe_forward"] else "N/A")
-    f4.metric("分析師共識評級", f_data["recommendation"])
+    f3.metric("Forward P/E", f"{f_data['pe_forward']:.1f}x" if f_data["pe_forward"] else "N/A")
+    f4.metric("Consensus Rating", f_data["recommendation"])
     
     f5, f6 = st.columns(2)
-    f5.metric("營收年增率 (YoY)", f"{f_data['rev_growth']*100:+.1f}%" if f_data["rev_growth"] else "N/A")
-    f6.metric("淨利率 (Profit Margin)", f"{f_data['profit_margin']*100:.1f}%" if f_data["profit_margin"] else "N/A")
-
-    st.info("**財報實戰守則**：若距離財報公布不到 **7 天**，即使技術面滿分也建議先減碼或觀望，避免財報開獎瞬間發生無法停損的跳空大跌（Earnings Gap Risk）。")
+    f5.metric("Revenue Growth (YoY)", f"{f_data['rev_growth']*100:+.1f}%" if f_data["rev_growth"] else "N/A")
+    f6.metric("Profit Margin", f"{f_data['profit_margin']*100:.1f}%" if f_data["profit_margin"] else "N/A")
 
 with col_news:
-    news_tab1, news_tab2 = st.tabs([f"{selected_ticker} 專屬即時外電", "華爾街大盤總經頭條 (SPY/QQQ)"])
+    news_tab1, news_tab2 = st.tabs([f"{selected_ticker} Latest English News", "Wall Street Macro Headlines (US Market)"])
     
     with news_tab1:
-        ticker_news = fetch_realtime_news(selected_ticker)
+        ticker_news = fetch_english_news(selected_ticker, is_macro=False)
         if ticker_news:
             for n in ticker_news:
                 st.markdown(f"**• [{n['title']}]({n['link']})**  \n<span style='color:gray;font-size:12px;'>{n['publisher']} ｜ {n['time']}</span>", unsafe_allow_html=True)
         else:
-            st.write("暫無最新個股外電。")
+            st.write("No recent English news found.")
             
     with news_tab2:
-        macro_news = fetch_realtime_news("SPY")
+        macro_news = fetch_english_news("SPY", is_macro=True)
         if macro_news:
             for n in macro_news:
                 st.markdown(f"**• [{n['title']}]({n['link']})**  \n<span style='color:gray;font-size:12px;'>{n['publisher']} ｜ {n['time']}</span>", unsafe_allow_html=True)
         else:
-            st.write("暫無最新大盤頭條。")
+            st.write("No recent macro headlines found.")
 
-# 觸發盤中自動更新機制
 if auto_refresh:
     time.sleep(refresh_sec)
     st.cache_data.clear()
