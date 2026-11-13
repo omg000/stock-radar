@@ -2,8 +2,9 @@ import os
 import json
 import time
 import urllib.request
+import urllib.parse
 import xml.etree.ElementTree as ET
-from datetime import datetime, date, time as dt_time, timedelta
+from datetime import datetime, date, time as dt_time
 from zoneinfo import ZoneInfo
 import streamlit as st
 import yfinance as yf
@@ -12,12 +13,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # 1. 網頁基本設定
-st.set_page_config(page_title="美股量化實戰雷達 4.0", page_icon="🦅", layout="wide")
+st.set_page_config(page_title="美股量化實戰雷達 4.1", page_icon="🦅", layout="wide")
 
 # ==========================================
-# 記憶儲存引擎 (自動記住預算、自選股、上次看的標的與持倉)
+# 6位數簡易通行碼 (PIN) 記憶保險箱引擎
 # ==========================================
-MEMORY_FILE = "user_state_v4.json"
+VAULT_FILE = "pin_vault_v4.json"
 
 DEFAULT_STATE = {
     "capital": 10000.0,
@@ -31,43 +32,53 @@ DEFAULT_STATE = {
     ]
 }
 
-def load_user_state():
-    if "user_state" not in st.session_state:
-        if os.path.exists(MEMORY_FILE):
-            try:
-                with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-                    saved = json.load(f)
-                    merged = DEFAULT_STATE.copy()
-                    merged.update(saved)
-                    st.session_state.user_state = merged
-            except Exception:
-                st.session_state.user_state = DEFAULT_STATE.copy()
-        else:
-            st.session_state.user_state = DEFAULT_STATE.copy()
-    return st.session_state.user_state
+def load_vault():
+    if os.path.exists(VAULT_FILE):
+        try:
+            with open(VAULT_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
 
-def save_user_state():
+def save_to_vault(pin_code, user_data):
+    vault = load_vault()
+    vault[pin_code.upper()] = user_data
     try:
-        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(st.session_state.user_state, f, ensure_ascii=False, indent=2)
+        with open(VAULT_FILE, "w", encoding="utf-8") as f:
+            json.dump(vault, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
-state = load_user_state()
+# 讀取網址上的 ?pin= 參數，預設為 888999
+query_pin = st.query_params.get("pin", "888999").upper()
+if "current_pin" not in st.session_state:
+    st.session_state.current_pin = query_pin
+
+vault_db = load_vault()
+if "user_state" not in st.session_state:
+    if st.session_state.current_pin in vault_db:
+        saved = vault_db[st.session_state.current_pin]
+        merged = DEFAULT_STATE.copy()
+        merged.update(saved)
+        st.session_state.user_state = merged
+    else:
+        st.session_state.user_state = DEFAULT_STATE.copy()
+        save_to_vault(st.session_state.current_pin, st.session_state.user_state)
+
+def sync_state():
+    save_to_vault(st.session_state.current_pin, st.session_state.user_state)
+
+state = st.session_state.user_state
 
 # ==========================================
 # 內建市場母體池 (供系統自動海選最強勢標的)
 # ==========================================
 MARKET_UNIVERSE = [
-    # 科技巨頭與核心權值
     "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "NFLX",
-    # AI 半導體與硬體
     "AMD", "AVGO", "TSM", "MU", "ARM", "SMCI", "MRVL", "ANET", "VRT", "DELL",
-    # 軟體、資安與大數據
     "PLTR", "CRWD", "PANW", "NOW", "SNOW", "ORCL", "CRM", "SHOP", "APP", "IOT",
-    # 金融、支付與加密概念
     "JPM", "GS", "V", "MA", "AXP", "COIN", "HOOD", "SOFI", "MSTR",
-    # 醫療生技、消費與工業能源
     "LLY", "ISRG", "UNH", "COST", "WMT", "UBER", "CAT", "GE", "XOM", "CEG", "VST"
 ]
 
@@ -78,23 +89,18 @@ def get_us_market_status():
     now_et = datetime.now(ZoneInfo("America/New_York"))
     now_tw = datetime.now(ZoneInfo("Asia/Taipei"))
     
-    # 美股主要固定國定假日 (2026)
     us_holidays = {
         date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
         date(2026, 5, 25), date(2026, 6, 19), date(2026, 7, 3), date(2026, 9, 7),
         date(2026, 11, 26), date(2026, 12, 25)
     }
     
-    weekday = now_et.weekday() # 0=週一 ... 5=週六, 6=週日
+    weekday = now_et.weekday()
     curr_time = now_et.time()
-    
-    open_t = dt_time(9, 30)
-    close_t = dt_time(16, 0)
-    pre_t = dt_time(4, 0)
-    after_t = dt_time(20, 0)
+    open_t, close_t, pre_t, after_t = dt_time(9, 30), dt_time(16, 0), dt_time(4, 0), dt_time(20, 0)
     
     if weekday >= 5 or now_et.date() in us_holidays:
-        status_badge = "🔴 美股休市中 (Market Closed - 週末/假日)"
+        status_badge = "🔴 美股休市中 (週末 / 國定假日休市)"
         detail = "目前為休市時段，系統顯示為最新一個交易日之收盤與籌碼數據。"
     elif open_t <= curr_time < close_t:
         close_dt = datetime.combine(now_et.date(), close_t, tzinfo=ZoneInfo("America/New_York"))
@@ -114,37 +120,56 @@ def get_us_market_status():
         status_badge = "🌙 美股盤後交易時段 (After-Hours)"
         detail = "正規盤已收盤，目前為盤後電子盤交易時段。"
     else:
-        status_badge = "🔴 美股休市中 (Overnight Closed)"
-        detail = "夜盤休市時段，等待美東時間 04:00 盤前開市。"
+        status_badge = "🔴 美股夜盤休市中"
+        detail = "等待美東時間 04:00 盤前開市。"
         
-    time_str = f"🗽 美東時間: {now_et.strftime('%Y-%m-%d %H:%M')} ET ｜ 🇹🇼 台灣時間: {now_tw.strftime('%Y-%m-%d %H:%M')}"
+    time_str = f"美東時間: {now_et.strftime('%Y-%m-%d %H:%M')} ET ｜ 🇹🇼 台灣時間: {now_tw.strftime('%Y-%m-%d %H:%M')}"
     return status_badge, detail, time_str
 
-# 頂部標題與開盤狀態橫幅
-st.title("美股量化實戰追蹤系統 4.0")
+st.title("美股量化實戰追蹤系統 4.1")
 mkt_badge, mkt_detail, mkt_clock = get_us_market_status()
-st.info(f"**{mkt_badge}** \n{mkt_clock} ｜{mkt_detail}")
+st.info(f"**{mkt_badge}** \n {mkt_clock} ｜ {mkt_detail}")
 
 # ==========================================
-# 側邊欄：自動記憶設定、系統自動選股與風控參數
+# 側邊欄：6位數記憶通行碼、自動選股與風控設定
 # ==========================================
-st.sidebar.header("智慧記憶與選股設定")
+st.sidebar.header("🔑 6位數專屬記憶通行碼")
+st.sidebar.caption("輸入約 6 碼英數組合（如 `888999` 或 `A12345`），系統會自動記憶並綁定你的預算、倉位與自選股！")
+
+col_pin1, col_pin2 = st.sidebar.columns([2, 1.2])
+with col_pin1:
+    pin_input = st.text_input("專屬通行碼", value=st.session_state.current_pin, max_chars=10, label_visibility="collapsed").strip().upper()
+with col_pin2:
+    if st.button("載入/切換", use_container_width=True):
+        if pin_input:
+            st.session_state.current_pin = pin_input
+            st.query_params["pin"] = pin_input
+            v_db = load_vault()
+            if pin_input in v_db:
+                merged = DEFAULT_STATE.copy()
+                merged.update(v_db[pin_input])
+                st.session_state.user_state = merged
+                st.sidebar.success(f"已載入 [{pin_input}] 的記憶！")
+            else:
+                save_to_vault(pin_input, st.session_state.user_state)
+                st.sidebar.success(f"已建立新通行碼 [{pin_input}]！")
+            st.rerun()
+
+st.sidebar.markdown(f"目前綁定記憶碼：**`{st.session_state.current_pin}`** (已自動存檔)")
+st.sidebar.divider()
 
 auto_refresh = st.sidebar.toggle("開啟盤中自動更新", value=False)
 refresh_sec = st.sidebar.selectbox("自動更新頻率 (秒)", [60, 180, 300], index=1)
 
 st.sidebar.subheader("系統自動選股 + 自選清單")
-new_auto_count = st.sidebar.slider("系統自動海選強勢股數量", min_value=5, max_value=25, value=int(state["auto_pick_count"]), step=1,
-                                   help="系統會從美股45+檔核心流動性母體池中，自動用演算法挑出分數最高的強勢股！")
-new_watchlist = st.sidebar.text_area("⭐ 我的自選觀察清單 (逗號分隔)", value=state["custom_watchlist"], height=70,
-                                     help="除了系統自動選出的股票外，你在這裡輸入的股票也一定會被加入追蹤！")
+new_auto_count = st.sidebar.slider("系統自動海選強勢股數量", min_value=5, max_value=25, value=int(state["auto_pick_count"]), step=1)
+new_watchlist = st.sidebar.text_area("⭐ 我的自選觀察清單 (逗號分隔)", value=state["custom_watchlist"], height=70)
 
 st.sidebar.subheader("預算與量化風控 (自動記憶)")
 new_capital = st.sidebar.number_input("我的總投資預算 (USD)", min_value=500.0, value=float(state["capital"]), step=500.0)
 new_risk = st.sidebar.slider("單筆最大承受虧損 (%)", 0.5, 5.0, float(state["risk_pct"]), 0.5)
 new_atr = st.sidebar.slider("ATR 停損寬度 (倍)", 1.0, 4.0, float(state["atr_mult"]), 0.5)
 
-# 若參數有變更，立即自動儲存記憶
 if (new_auto_count != state["auto_pick_count"] or new_watchlist != state["custom_watchlist"] or
     new_capital != state["capital"] or new_risk != state["risk_pct"] or new_atr != state["atr_mult"]):
     state["auto_pick_count"] = new_auto_count
@@ -152,39 +177,34 @@ if (new_auto_count != state["auto_pick_count"] or new_watchlist != state["custom
     state["capital"] = new_capital
     state["risk_pct"] = new_risk
     state["atr_mult"] = new_atr
-    save_user_state()
+    sync_state()
 
 st.sidebar.subheader("表格快速過濾")
 min_score = st.sidebar.slider("最低強度評分門檻", 0, 100, 0, 5)
 only_inflow = st.sidebar.checkbox("只顯示「主力資金淨流入 (CMF > 0)」", value=False)
 
-with st.sidebar.expander("記憶備份碼 (跨裝置/防重置保護)"):
-    st.caption("系統已自動在雲端記憶你的設定。若你想跨手機/電腦同步，可複製下方備份碼：")
-    backup_str = json.dumps(state, ensure_ascii=False)
-    st.code(backup_str, language="json")
-    restore_input = st.text_input("貼上備份碼還原設定：")
-    if st.button("還原記憶設定") and restore_input:
-        try:
-            st.session_state.user_state = json.loads(restore_input)
-            save_user_state()
-            st.success("已成功還原！")
-            st.rerun()
-        except Exception:
-            st.error("備份碼格式錯誤")
-
-# 解析使用者的自選股與持倉股
 user_custom_list = [t.strip().upper() for t in state["custom_watchlist"].split(",") if t.strip()]
 portfolio_tickers = [str(item.get("Ticker", "")).strip().upper() for item in state["portfolio"] if item.get("Ticker")]
 
 # ==========================================
-# 輔助函數：財報日、基本面與純英文華爾街新聞
+# 輔助函數：全中文財報基本面 ＆ 華爾街外電自動中文化
 # ==========================================
+RATING_MAP_ZH = {
+    "STRONG_BUY": "強力買進",
+    "BUY": "買進",
+    "HOLD": "觀望持有",
+    "UNDERPERFORM": "表現落後",
+    "SELL": "賣出",
+    "NONE": "暫無評級",
+    "N/A": "暫無評級"
+}
+
 @st.cache_data(ttl=1800)
 def get_earnings_and_fundamentals(sym):
     res = {
         "earnings_str": "未知", "days_to_earnings": 999,
         "pe_forward": None, "rev_growth": None, "profit_margin": None,
-        "target_price": None, "recommendation": "N/A"
+        "target_price": None, "recommendation_zh": "暫無評級"
     }
     try:
         tk = yf.Ticker(sym)
@@ -205,11 +225,11 @@ def get_earnings_and_fundamentals(sym):
                 days_diff = (e_date - date.today()).days
                 res["days_to_earnings"] = days_diff
                 if 0 <= days_diff <= 14:
-                    res["earnings_str"] = f"{e_date.strftime('%m/%d')} ({days_diff}d)"
+                    res["earnings_str"] = f"{e_date.strftime('%m/%d')} ({days_diff}天後)"
                 elif days_diff > 14:
-                    res["earnings_str"] = f"{e_date.strftime('%m/%d')} ({days_diff}d)"
+                    res["earnings_str"] = f"{e_date.strftime('%m/%d')} ({days_diff}天後)"
                 else:
-                    res["earnings_str"] = f"Passed ({e_date.strftime('%m/%d')})"
+                    res["earnings_str"] = f"已公布 ({e_date.strftime('%m/%d')})"
                     
         info = tk.info
         if isinstance(info, dict):
@@ -217,15 +237,26 @@ def get_earnings_and_fundamentals(sym):
             res["rev_growth"] = info.get("revenueGrowth")
             res["profit_margin"] = info.get("profitMargins")
             res["target_price"] = info.get("targetMeanPrice")
-            res["recommendation"] = str(info.get("recommendationKey", "N/A")).upper()
+            raw_rec = str(info.get("recommendationKey", "N/A")).upper()
+            res["recommendation_zh"] = RATING_MAP_ZH.get(raw_rec, raw_rec)
     except Exception:
         pass
     return res
 
+def translate_to_zh(text):
+    """將華爾街英文新聞標題自動翻譯為繁體中文"""
+    try:
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-TW&dt=t&q={urllib.parse.quote(text)}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=3) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            return "".join([part[0] for part in data[0] if part[0]])
+    except Exception:
+        return text
+
 @st.cache_data(ttl=300)
-def fetch_english_news(sym, is_macro=False):
+def fetch_zh_wallstreet_news(sym, is_macro=False):
     news_items = []
-    # 使用 Google News US English RSS 確保 100% 純英文華爾街財經新聞與穩定連結
     try:
         if is_macro:
             query = "US+stock+market+Wall+Street+Fed+S%26P500"
@@ -235,13 +266,23 @@ def fetch_english_news(sym, is_macro=False):
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=5) as response:
             root = ET.fromstring(response.read())
-            for item in root.findall('.//item')[:8]:
-                title = item.find('title').text if item.find('title') is not None else ""
+            for item in root.findall('.//item')[:7]:
+                title_en = item.find('title').text if item.find('title') is not None else ""
+                # 移除標題尾端重複的媒體名稱以利精準翻譯
+                clean_en = title_en.rsplit(" - ", 1)[0] if " - " in title_en else title_en
+                title_zh = translate_to_zh(clean_en)
+                
                 link = item.find('link').text if item.find('link') is not None else ""
-                pub = item.find('source').text if item.find('source') is not None else "US Financial News"
+                pub = item.find('source').text if item.find('source') is not None else "華爾街外電"
                 pub_date = item.find('pubDate').text[:16] if item.find('pubDate') is not None else ""
-                if title:
-                    news_items.append({"title": title, "link": link, "publisher": pub, "time": pub_date})
+                if title_en:
+                    news_items.append({
+                        "title_zh": title_zh,
+                        "title_en": clean_en,
+                        "link": link,
+                        "publisher": pub,
+                        "time": pub_date
+                    })
     except Exception:
         pass
     return news_items
@@ -363,7 +404,6 @@ def run_quant_screener(universe_list, custom_list, port_list, auto_top_n, total_
             risk_per_share = curr_p - stop_loss_price
             suggested_shares = int((total_cap * (risk_p / 100.0)) // risk_per_share) if risk_per_share > 0 else 0
 
-            # 100分制量化評分
             trend_pts = (12 if curr_p > ma20 else 0) + (10 if curr_p > ma50 else 0) + (10 if curr_p > ma200 else 0) + (8 if ma20 > ma50 > ma200 else 0)
             cmf_pts = int(((max(-0.25, min(0.25, cmf20)) + 0.25) / 0.50) * 30)
             rvol_pts = int(min(20, max(0, (rvol - 0.5) * 13))) if pct_chg >= 0 else int(max(0, 10 - (rvol - 0.8) * 10))
@@ -378,7 +418,6 @@ def run_quant_screener(universe_list, custom_list, port_list, auto_top_n, total_
         except Exception:
             continue
             
-    # 先按分數與主力資金排序，挑出系統自動海選 Top N，並強制保留使用者的自選股與持倉股
     scored_items.sort(key=lambda x: (x["score"], x["cmf20"]), reverse=True)
     
     final_rows = []
@@ -392,7 +431,6 @@ def run_quant_screener(universe_list, custom_list, port_list, auto_top_n, total_
             if not is_custom and not is_port:
                 auto_picked_count += 1
                 
-            # 標記來源標籤
             tags = []
             if is_port: tags.append("持倉")
             if is_custom: tags.append("⭐自選")
@@ -430,22 +468,22 @@ def run_quant_screener(universe_list, custom_list, port_list, auto_top_n, total_
             
     return pd.DataFrame(final_rows), raw_histories, price_lookup, atr_stop_lookup
 
-with st.spinner("正在掃描全市場 45+ 檔核心標的，自動海選最強趨勢股與計算持倉損益..."):
+with st.spinner("正在掃描全市場核心標的，自動海選最強趨勢股與計算持倉損益..."):
     df_scan, histories, live_prices, live_stops = run_quant_screener(
         MARKET_UNIVERSE, user_custom_list, portfolio_tickers,
         state["auto_pick_count"], state["capital"], state["risk_pct"], state["atr_mult"]
     )
 
 # ==========================================
-# 模組二：持倉部位與預算管理 (自動記憶)
+# 模組二：我的持倉部位與預算管理中心 (綁定 6位數通行碼)
 # ==========================================
-st.subheader("我的持倉倉位與預算損益管理（支援直接編輯 ＆ 自動記憶）")
-st.caption("你可以在下方表格直接**修改股數與成本價**、點擊表格底部 `+` **新增持倉**，或勾選左側垃圾桶**刪除持倉**，系統會自動記憶並即時計算損益與停損警報！")
+st.subheader(f"持倉倉位與預算損益管理（已綁定記憶碼：`{st.session_state.current_pin}`）")
+st.caption("直接在左表修改股數與成本價、點底部 `+` 新增持倉，系統會自動存入你的 6 位數通行碼中！")
 
 col_port_edit, col_port_summary = st.columns([1.4, 2.6])
 
 with col_port_edit:
-    st.markdown("##### 編輯我的持倉清單")
+    st.markdown("#####編輯我的持倉清單")
     port_df_input = pd.DataFrame(state["portfolio"]) if state["portfolio"] else pd.DataFrame(columns=["Ticker", "Shares", "Avg_Cost"])
     edited_port_df = st.data_editor(
         port_df_input,
@@ -458,7 +496,6 @@ with col_port_edit:
             "Avg_Cost": st.column_config.NumberColumn("平均買進成本 ($)", min_value=0.01, step=0.5, required=True)
         }
     )
-    # 檢查持倉是否有變更並自動存檔
     cleaned_port = []
     for _, r in edited_port_df.iterrows():
         t_val = str(r.get("Ticker", "")).strip().upper()
@@ -468,7 +505,7 @@ with col_port_edit:
             cleaned_port.append({"Ticker": t_val, "Shares": s_val, "Avg_Cost": c_val})
     if cleaned_port != state["portfolio"]:
         state["portfolio"] = cleaned_port
-        save_user_state()
+        sync_state()
         st.rerun()
 
 with col_port_summary:
@@ -546,7 +583,7 @@ st.divider()
 # 模組三：系統自動海選強勢股 ＋ 自選股雷達總表
 # ==========================================
 st.subheader("AI 演算法全市場自動海選強勢股 ＆ 自選股雷達")
-st.caption(f"系統已從美股 45+ 檔核心流動性標的池中，自動為你海選出 **Top {state['auto_pick_count']} 最強勢標的（🤖系統優選）**，並合併你的 **⭐自選觀察** 與 **💼持倉部位**！")
+st.caption(f"系統已從美股 45+ 檔核心標的池中，自動海選出 **Top {state['auto_pick_count']} 最強勢標的（系統優選）**，並合併你的 **⭐自選觀察** 與 **持倉部位**！")
 
 col_b1, col_b2 = st.columns([1, 4])
 with col_b1:
@@ -565,7 +602,7 @@ if not df_scan.empty:
         hide_index=True,
         column_config={
             "強度評分": st.column_config.ProgressColumn("綜合強度 (0-100)", format="%d 分", min_value=0, max_value=100),
-            "下次財報日": st.column_config.TextColumn("📅 財報避雷針"),
+            "下次財報日": st.column_config.TextColumn("財報避雷針"),
             "近20日走勢": st.column_config.LineChartColumn("近20日趨勢線"),
             "單日漲跌 (%)": st.column_config.NumberColumn("漲跌幅 (%)", format="%+.2f%%"),
             "CMF 主力資金": st.column_config.NumberColumn("CMF 籌碼流", help=">0 代表主力買超吸籌，>0.1 為強烈買進"),
@@ -576,9 +613,9 @@ if not df_scan.empty:
 st.divider()
 
 # ==========================================
-# 上次瀏覽標的 K 線
+# 模組四：記憶上次瀏覽標的之直覺觸控 K 線看盤室
 # ==========================================
-st.subheader(" K 線（自動記憶上次查看標的）")
+st.subheader(" K 線")
 st.caption("操作小撇步：在 K 線圖上直接用「單指左右滑動」可平移時間軸，用「雙指張開/捏合（或滑鼠滾輪）」可自由放大縮小！")
 
 if not df_scan.empty:
@@ -590,7 +627,7 @@ if not df_scan.empty:
         selected_ticker = st.selectbox("選擇深度剖析標的 (自動記憶)：", available_tickers, index=default_idx)
         if selected_ticker != state["last_selected_ticker"]:
             state["last_selected_ticker"] = selected_ticker
-            save_user_state()
+            sync_state()
     with c_sel2:
         timeframe = st.radio(
             "選擇 K 線週期：",
@@ -666,51 +703,63 @@ if not df_scan.empty:
 st.divider()
 
 # ==========================================
-# 個股財報基本面 ＆ 華爾街純英文即時外電 
+# 模組五：全中文個股財報基本面 ＆ 華爾街外電中英雙語快訊
 # ==========================================
-st.subheader(f"：{selected_ticker} 財報基本面體質 ＆ Wall Street English News")
+st.subheader(f"：{selected_ticker} 財報基本面 ＆ 華爾街即時新聞")
 
 col_fund, col_news = st.columns([1.2, 1.8])
 
 with col_fund:
-    st.markdown(f"#### {selected_ticker} Earnings & Fundamentals")
+    st.markdown(f"#### {selected_ticker} 財報與機構目標價診斷")
     f_data = get_earnings_and_fundamentals(selected_ticker)
     curr_price_sel = float(histories[selected_ticker]['Close'].iloc[-1])
     
     f1, f2 = st.columns(2)
-    f1.metric("Next Earnings Date", f_data["earnings_str"])
+    f1.metric("下次財報公布日", f_data["earnings_str"])
     if f_data["target_price"]:
         upside = ((f_data["target_price"] - curr_price_sel) / curr_price_sel) * 100
-        f2.metric("Analyst Target Price", f"${f_data['target_price']:.2f}", f"{upside:+.1f}% Upside")
+        f2.metric("華爾街平均目標價", f"${f_data['target_price']:.2f}", f"{upside:+.1f}% 潛在空間")
     else:
-        f2.metric("Analyst Target Price", "N/A")
+        f2.metric("華爾街平均目標價", "暫無數據")
         
     f3, f4 = st.columns(2)
-    f3.metric("Forward P/E", f"{f_data['pe_forward']:.1f}x" if f_data["pe_forward"] else "N/A")
-    f4.metric("Consensus Rating", f_data["recommendation"])
+    f3.metric("預估本益比 (Forward P/E)", f"{f_data['pe_forward']:.1f} 倍" if f_data["pe_forward"] else "暫無數據")
+    f4.metric("機構分析師共識評級", f_data["recommendation_zh"])
     
     f5, f6 = st.columns(2)
-    f5.metric("Revenue Growth (YoY)", f"{f_data['rev_growth']*100:+.1f}%" if f_data["rev_growth"] else "N/A")
-    f6.metric("Profit Margin", f"{f_data['profit_margin']*100:.1f}%" if f_data["profit_margin"] else "N/A")
+    f5.metric("營收年增率 (YoY)", f"{f_data['rev_growth']*100:+.1f}%" if f_data["rev_growth"] else "暫無數據")
+    f6.metric("企業淨利率", f"{f_data['profit_margin']*100:.1f}%" if f_data["profit_margin"] else "暫無數據")
+
+    st.info("**財報實戰守則**：若距離財報公布不到 **7 天**，建議先避開或減碼，防止財報開獎瞬間發生跳空風險。")
 
 with col_news:
-    news_tab1, news_tab2 = st.tabs([f"{selected_ticker} Latest English News", "Wall Street Macro Headlines (US Market)"])
+    news_tab1, news_tab2 = st.tabs([f"{selected_ticker} 最新外電", "華爾街大盤總經頭條"])
     
     with news_tab1:
-        ticker_news = fetch_english_news(selected_ticker, is_macro=False)
+        ticker_news = fetch_zh_wallstreet_news(selected_ticker, is_macro=False)
         if ticker_news:
             for n in ticker_news:
-                st.markdown(f"**• [{n['title']}]({n['link']})**  \n<span style='color:gray;font-size:12px;'>{n['publisher']} ｜ {n['time']}</span>", unsafe_allow_html=True)
+                st.markdown(
+                    f"**• [{n['title_zh']}]({n['link']})**  \n"
+                    f"<span style='color:#9e9e9e;font-size:12px;'>🇺🇸 原題：{n['title_en']}</span>  \n"
+                    f"<span style='color:gray;font-size:12px;'>來源：{n['publisher']} ｜{n['time']}</span>",
+                    unsafe_allow_html=True
+                )
         else:
-            st.write("No recent English news found.")
+            st.write("暫無最新個股外電新聞。")
             
     with news_tab2:
-        macro_news = fetch_english_news("SPY", is_macro=True)
+        macro_news = fetch_zh_wallstreet_news("SPY", is_macro=True)
         if macro_news:
             for n in macro_news:
-                st.markdown(f"**• [{n['title']}]({n['link']})**  \n<span style='color:gray;font-size:12px;'>{n['publisher']} ｜ {n['time']}</span>", unsafe_allow_html=True)
+                st.markdown(
+                    f"**• [{n['title_zh']}]({n['link']})**  \n"
+                    f"<span style='color:#9e9e9e;font-size:12px;'>🇺🇸 原題：{n['title_en']}</span>  \n"
+                    f"<span style='color:gray;font-size:12px;'>來源：{n['publisher']} ｜{n['time']}</span>",
+                    unsafe_allow_html=True
+                )
         else:
-            st.write("No recent macro headlines found.")
+            st.write("暫無最新大盤總經頭條。")
 
 if auto_refresh:
     time.sleep(refresh_sec)
